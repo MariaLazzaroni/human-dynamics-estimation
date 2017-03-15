@@ -1,0 +1,4 @@
+<map id="RFModule" name="RFModule">
+<area shape="rect" id="node2" href="$class_human_dynamics_estimator.html" title="{HumanDynamicsEstimator\n|&#45; modelFilename\l&#45; count\l|+ getPeriod()\l+ configure()\l+ updateModule()\l+ interruptModule()\l+ close()\l}" alt="" coords="5,190,184,341"/>
+<area shape="rect" id="node3" href="$class_human_forces_provider.html" title="{HumanForcesProvider\n|&#45; m_period\l&#45; m_humanJointConfiguration_port\l&#45; m_forcePoly1\l&#45; m_forcePoly2\l&#45; m_PolyRobot\l&#45; m_robotLeftArmForce_port\l&#45; m_robotRightArmForce_port\l&#45; m_output_port\l&#45; m_readers\l|+ HumanForcesProvider()\l+ ~HumanForcesProvider()\l+ getPeriod()\l+ configure()\l+ updateModule()\l+ close()\l}" alt="" coords="208,131,429,399"/>
+</map>
