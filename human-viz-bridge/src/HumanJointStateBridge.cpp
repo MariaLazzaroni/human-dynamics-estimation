@@ -13,6 +13,7 @@
 #include <yarp/os/LogStream.h>
 #include <yarp/os/Network.h>
 #include <yarp/os/Node.h>
+#include <yarp/os/Property.h>
 #include <yarp/os/Publisher.h>
 #include <yarp/os/RFModule.h>
 #include <yarp/os/Time.h>
@@ -67,11 +68,9 @@ class xsensJointStatePublisherModule : public RFModule, public TypedReaderCallba
 
     Publisher<sensor_msgs_JointState> publisher;
     Publisher<tf2_msgs_TFMessage> publisher_tf;
-    
-    //variables declaration
     sensor_msgs_JointState joint_state;
     tf2_msgs_TFMessage tf;
-    
+
 public:
     double getPeriod()
     {
@@ -115,15 +114,34 @@ public:
         tf.transforms[0].child_frame_id = rf.find("tfPrefix").asString() + "/" + rf.find("childLinkRFName").asString();
         
         vector<string> joints;
-        if (!parseFrameListOption(rf.find("jointList"), joints)) {
-            yError() << "Error while parsing joints list";
+        Value jointListValue = rf.find("jointList");
+        if (jointListValue.isString()) {
+            string configJointFile = rf.findFileByName(jointListValue.asString());
+            Property config;
+            if (config.fromConfigFile(configJointFile, true)) {
+                if (!parseFrameListOption(config.find("jointList"), joints)) {
+                    yError() << "Error while parsing joints list";
+                    return false;
+                }
+            } else {
+                yError() << "Could not parse " << configJointFile;
+                return false;
+            }
+        }
+        else if (jointListValue.isList()) {
+            if (!parseFrameListOption(jointListValue, joints)) {
+                yError() << "Error while parsing joints list";
+                return false;
+            }
+        } else {
+            yError() << "\"jointList\" parameter malformed";
             return false;
         }
 
         Value defaultAutoconn; defaultAutoconn.fromString("false");
         bool autoconnect = rf.check("autoconnect", defaultAutoconn, "Checking autoconnection mode").asBool();
 
-        yInfo() << "Joints from config file: " << model.getNrOfJoints() << joints;
+        yInfo() << "Joints from config file: " << joints.size() << joints;
 
         vector<string> URDFjoints;
         URDFjoints.reserve(model.getNrOfJoints());
@@ -143,7 +161,7 @@ public:
             }
         }
         
-        yInfo() << "Joints from URDf: " << URDFjoints[0].compare(joints[0]) << URDFjoints;
+        yInfo() << "Joints from URDF: " << URDFjoints.size() << URDFjoints;
         
         joint_state.name.resize(model.getNrOfJoints());
         
@@ -157,7 +175,7 @@ public:
         
         humanStateDataPort.useCallback(*this);
         string serverName = rf.check("stateprovider_name", Value("human-state-provider"), "Checking server name").asString();
-        string stateProviderServerName = "/" + rf.find("serverName").asString() + "/state:o";
+        string stateProviderServerName = "/" + rf.find("stateprovider_name").asString() + "/state:o";
         string stateReaderPortName = "/" + getName() + "/state:i";
         humanStateDataPort.open(stateReaderPortName);
 
@@ -185,13 +203,16 @@ public:
     virtual void onRead(HumanState& humanStateData) {
     
         TickTime currentTime = normalizeSecNSec(yarp::os::Time::now());
+        tf2_msgs_TFMessage &tfMsg = publisher_tf.prepare();
+        sensor_msgs_JointState &jointStateMsg = publisher.prepare();
         joint_state.header.stamp = currentTime;
         
         for (size_t index = 0; index < joint_state.position.size(); ++index){
             joint_state.position[index] = humanStateData.positions[index];
         }
+        jointStateMsg = joint_state;
         
-        publisher.write(joint_state);
+        publisher.write();
 
         tf.transforms[0].header.seq   = 1;
         tf.transforms[0].header.stamp = currentTime;
@@ -202,9 +223,9 @@ public:
         tf.transforms[0].transform.rotation.y = humanStateData.baseOrientationWRTGlobal.imaginary.y;
         tf.transforms[0].transform.rotation.z = humanStateData.baseOrientationWRTGlobal.imaginary.z;
         tf.transforms[0].transform.rotation.w = humanStateData.baseOrientationWRTGlobal.w;
-
-        publisher_tf.write(tf);
-
+        tfMsg = tf;
+        
+        publisher_tf.write();
     }
 };
 

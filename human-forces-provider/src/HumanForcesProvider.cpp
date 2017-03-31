@@ -1,5 +1,5 @@
 /*!
- * @file ForceReader.h
+ * @file HumanForcesProvider.cpp
  * @author Claudia Latella
  * @date 2017
  * @copyright iCub Facility - Istituto Italiano di Tecnologia
@@ -16,462 +16,575 @@
 #include "RobotFrameTransformer.h"
 
 #include <yarp/os/LogStream.h> 
+#include <yarp/os/Network.h>
+#include <yarp/os/Node.h>
+#include <yarp/os/Property.h>
+#include <yarp/os/Publisher.h>
+#include <yarp/os/Time.h>
 #include <yarp/dev/IAnalogSensor.h>
-#include <yarp/dev/api.h> //for IEncoders binaries
 #include <yarp/dev/IEncoders.h>
+#include <yarp/dev/ControlBoardInterfaces.h>
 
 #include <iDynTree/Core/MatrixFixSize.h>
 #include <iDynTree/Core/VectorDynSize.h>
 #include <iDynTree/Core/Transform.h>
 #include <iDynTree/ModelIO/ModelLoader.h>
 
-#include <iostream>
-#include <cassert>
+#include <iDynTree/Core/EigenHelpers.h>
+
+#include <TickTime.h>
+#include <iterator>
 
 
 //---------------------------------------------------------------------------
 //Utility functions for parsing INI file
 static bool parseRotationMatrix(const yarp::os::Value&, iDynTree::Rotation&);
 static bool parsePositionVector(const yarp::os::Value&, iDynTree::Position&);
+static bool parseStringListOption(const yarp::os::Value &option, std::vector<std::string> &parsedList);
 //---------------------------------------------------------------------------
+
+static inline TickTime normalizeSecNSec(double yarpTimeStamp)
+{
+    uint64_t time = static_cast<uint64_t>(yarpTimeStamp * 1000000000UL);
+    uint64_t nsec_part = (time % 1000000000UL);
+    uint64_t sec_part = (time / 1000000000UL);
+    TickTime ret;
+
+    if (sec_part > UINT_MAX)
+    {
+        yWarning() << "Timestamp exceeded the 64 bit representation, resetting it to 0";
+        sec_part = 0;
+    }
+
+    ret.sec  = sec_part;
+    ret.nsec = nsec_part;
+    return ret;
+}
+
+
+yarp::os::BufferedPort<human::HumanState>* HumanForcesProvider::getHumanStatePort(const yarp::os::Searchable& config)
+{
+    if (!m_humanConfigured) {
+
+        yarp::os::Value falseValue;
+        falseValue.fromString("false");
+        bool autoconnect = config.check("autoconnect",
+                                        falseValue,
+                                        "Checking the autoconnect option").asBool();
+
+        const std::string humanStateRemoteName = config.find("humanRemoteName").asString();
+
+        if (!m_humanJointConfigurationPort.open("/" + getName() + "/humanState:i"))
+        {
+            yError("Unable to open the input port [%s]", ("/" + getName() + "/humanState:i").c_str());
+            close();
+            return 0;
+        }
+        if (autoconnect)
+        {
+            if (!yarp::os::Network::connect(humanStateRemoteName, m_humanJointConfigurationPort.getName()))  //to connect remote and local port
+            {
+                yError("Unable to connect port [%s] to [%s]", humanStateRemoteName.c_str(), m_humanJointConfigurationPort.getName().c_str());
+                close();
+                return 0;
+            }
+        }
+        m_humanConfigured = true;
+    }
+    return &m_humanJointConfigurationPort;
+
+}
+
+bool HumanForcesProvider::getRobotEncodersInterface(const yarp::os::Searchable& config,
+                                                    const std::vector<std::string>& robot_jointList,
+                                                    yarp::dev::IEncoders *& encoders)
+{
+    if (!m_robotConfigured) {
+        /*
+         * ------Configure the autoconnect option
+         */
+        yarp::os::Value falseValue;
+        falseValue.fromString("false");
+        bool autoconnect = config.check("autoconnect",
+                                    falseValue,
+                                    "Checking the autoconnect option").asBool();
+
+        /*
+         * ------Robot configuration for the RemoteControlBoardRemapper
+         */
+        yarp::os::Bottle controlBoardGroup = config.findGroup("CONTROLBOARD_REMAPPER");
+        if(controlBoardGroup.isNull())
+        {
+            yError("Cannot find the CONTROLBOARD_REMAPPER group");
+            close();
+            return false;
+        }
+
+        yarp::os::Property options_robot;
+        options_robot.fromString(controlBoardGroup.toString());
+
+        yarp::os::Bottle axesNames;
+        yarp::os::Bottle &axesList = axesNames.addList();
+        for (std::vector<std::string>::const_iterator it = robot_jointList.begin(); it != robot_jointList.end(); ++it)
+        {
+            axesList.addString(*it);
+        }
+        options_robot.put("axesNames", axesNames.get(0));
+        options_robot.put("localPortPrefix", "/" + getName() + "/robot");
+
+        //TODO: find a better way to express VOCAB
+        //1987212385 is the int cast for VOCAB REVOLUTE JOINT TYPE
+
+        // Open the polydriver for the joints configuration
+        if (!m_robot.open(options_robot))
+        {
+            yError("Error in opening the device for the robot!");
+            close();
+            return false;
+        }
+
+        m_robotConfigured = true;
+    }
+
+    if (!m_robot.view(encoders) || !encoders)
+    {
+        yError("ControlBoard does not support IEncoders interface");
+        close();
+        return false;
+    }
+    return true;
+}
+
 
 
 HumanForcesProvider::HumanForcesProvider()
-: m_period(0.1){}
+: m_period(0.1)
+, m_humanConfigured(false)
+, m_robotConfigured(false) {}
 
-
+//---------------------------------------------------------------------
 HumanForcesProvider::~HumanForcesProvider() {}
 
-
+//---------------------------------------------------------------------
 double HumanForcesProvider::getPeriod()
 {
     return m_period;
 }
 
-
+//---------------------------------------------------------------------
 bool HumanForcesProvider::configure(yarp::os::ResourceFinder &rf)
 {
+    m_humanConfigured = false;
+    m_robotConfigured = false;
+
     /*
      * ------Configure module name
      */
-    std::string moduleName = rf.check("name",
-                                      yarp::os::Value("humanForceProvider"),
-                                      "Checking module name").asString();
+    const std::string moduleName = rf.check("name",
+                                            yarp::os::Value("human-forces-provider"),
+                                            "Checking module name").asString();
     setName(moduleName.c_str());
     
     /*
      * ------Configure module periodicity
      */
     int periodInMs = rf.check("period",
-                              yarp::os::Value(100),
+                              yarp::os::Value(10),
                               "Checking period in [ms]").asInt();
     m_period = periodInMs / 1000.0;
     
     /*
-     * ------Open a port for the human joint configuration
-     */
-    if (!m_humanJointConfiguration_port.open("/humanJointConfiguration:i"))
-    {
-        yError() << "Unable to open port /humanJointConfiguration:i";
-        return false;
-    }
-    
-    
-   /* **************** NOTE ON THE FORCE PLATES ********************************
-    * The configuration of the force plates consists into 2 parts:
-    * 1 -> INI configuration for the polydriver (since they are handled with a 
-    *      polydriver, documented in AnalogSensorClient.cpp of github/YARP) ;
-    * 2 -> INI configuration with the utility functions for the frame 
-    *      transformation.
-    * **************************************************************************/
-    
-    /*
-     * ------Configure force plate 1 (FP1)
-     */
-    std::string appliedLink_fp1  = rf.find("appliedLink_fp1").asString();
-    std::string inputFrame_fp1   = rf.find("inputFrame_fp1").asString();
-    std::string outputFrame_fp1  = rf.find("outputFrame_fp1").asString();
-
-    std::string ft1LocalName  = rf.check("ft1_localName",
-                                        yarp::os::Value("/" + getName() + "/FTSensor1:i"),
-                                        "Checking FP1 port local name").asString();
-    std::string ft1RemoteName = rf.check("ft1_remoteName",
-                                         yarp::os::Value("/amti/first/analog:o"),
-                                         "Checking FP1 port remote name").asString();
-    
-    iDynTree::Rotation rotationMatrix_fp1;
-    iDynTree::Position footPosition_fp1;
-    iDynTree::Position solePosition_fp1;
-    iDynTree::Position calibPosition_fp1;
-    iDynTree::Position position_fp1;
-    
-    if (!parseRotationMatrix(rf.find("rotationMatrix_fp1"), rotationMatrix_fp1))
-    {
-        yError("Somenthing wrong in parsing the rotation matrix!");
-        return false;
-    }
-    
-    if (!parsePositionVector(rf.find("footPosition_fp1"), footPosition_fp1))
-    {
-        yError("Somenthing wrong in parsing the foot position vector!");
-        return false;
-    }
-    
-    if (!parsePositionVector(rf.find("solePosition_fp1"), solePosition_fp1))
-    {
-        yError("Somenthing wrong in parsing the sole position vector!");
-        return false;
-    }
-    
-    if (!parsePositionVector(rf.find("calibPosition_fp1"), calibPosition_fp1))
-    {
-        yError("Somenthing wrong in parsing the calibration position vector!");
-        return false;
-    }
-    
-    position_fp1 = footPosition_fp1 + solePosition_fp1 + calibPosition_fp1;
-    iDynTree::Transform transform_fp1(rotationMatrix_fp1, position_fp1);
-    
-    /*
-     * ------Configure force plate 2 (FP2)
-     */
-    std::string appliedLink_fp2  = rf.find("appliedLink_fp2").asString();
-    std::string inputFrame_fp2   = rf.find("inputFrame_fp2").asString();
-    std::string outputFrame_fp2  = rf.find("outputFrame_fp2").asString();
-   
-    std::string ft2LocalName  = rf.check("ft2_localName",
-                                        yarp::os::Value("/" + getName() + "/FTSensor2:i"),
-                                        "Checking FP2 port local name").asString();
-    std::string ft2RemoteName = rf.check("ft2_remoteName",
-                                         yarp::os::Value("/amti/second/analog:o"),
-                                         "Checking FP2 port remote name").asString();
-    
-    iDynTree::Rotation rotationMatrix_fp2;
-    iDynTree::Position footPosition_fp2;
-    iDynTree::Position solePosition_fp2;
-    iDynTree::Position calibPosition_fp2;
-    iDynTree::Position position_fp2;
-    
-    if (!parseRotationMatrix(rf.find("rotationMatrix_fp2"), rotationMatrix_fp2))
-    {
-        yError("Somenthing wrong in parsing the rotation matrix!");
-        return false;
-    }
-    
-    if (!parsePositionVector(rf.find("footPosition_fp2"), footPosition_fp2))
-    {
-        yError("Somenthing wrong in parsing the foot position vector!");
-        return false;
-    }
-    
-    if (!parsePositionVector(rf.find("solePosition_fp2"), solePosition_fp2))
-    {
-        yError("Somenthing wrong in parsing the sole position vector!");
-        return false;
-    }
-    
-    if (!parsePositionVector(rf.find("calibPosition_fp2"), calibPosition_fp2))
-    {
-        yError("Somenthing wrong in parsing the calibration position vector!");
-        return false;
-    }
-    
-    position_fp2 = footPosition_fp2 + solePosition_fp2 + calibPosition_fp2;
-    iDynTree::Transform transform_fp2(rotationMatrix_fp2, position_fp2 );
-
-    
-    /*
-     * ------Configure and open the polidriver
-     */
-    yarp::os::Property options_FP;
-    options_FP.put("device", "analogsensorclient");
-    
-    //-----------------------SENSOR 1 : FP1 -------------------------------------//
-    
-    options_FP.put("local", ft1LocalName);          //local port name
-    options_FP.put("remote", ft1RemoteName);        //device port name where we connect to
-    
-    bool ok = m_forcePoly1.open(options_FP);
-    if (!ok)
-    {
-        yError("Error in opening FT1 Sensor device!");
-        close();
-        return false;
-    }
-
-    yarp::dev::IAnalogSensor *firstSensor = 0;
-    if (!m_forcePoly1.view(firstSensor) || !firstSensor)
-    {
-        yError("Error in viewing IAnalogSensor1!");
-        close();
-        return false;
-    }
-    
-    human::GenericFrameTransformer *frameTransform_fp1 = new human::GenericFrameTransformer(inputFrame_fp1,
-                                                                                            outputFrame_fp1);
-    frameTransform_fp1->setTransform(transform_fp1);
-    
-    human::FTForceReader *forceReader1 = new human::FTForceReader(appliedLink_fp1,
-                                                                  inputFrame_fp1,
-                                                                  *firstSensor);
-    forceReader1->setTransformer(frameTransform_fp1);
-    m_readers.push_back(forceReader1);
-    
-    
-    //-----------------------SENSOR 2 : FP2 -------------------------------------//
-    
-    options_FP.put("local" , ft2LocalName);          //local port name
-    options_FP.put("remote", ft2RemoteName);         //device port name where we connect to
-    
-    ok = m_forcePoly2.open(options_FP);
-    if (!ok)
-    {
-        yError("Error in opening FT2 Sensor device!");
-        close();
-        return false;
-    }
-    
-    yarp::dev::IAnalogSensor *secondSensor = 0;
-    if (!m_forcePoly2.view(secondSensor) || !secondSensor)
-    {
-        yError("Error in viewing IAnalogSensor2!");
-        close();
-        return false;
-    }
-    
-    human::GenericFrameTransformer *frameTransform_fp2 = new human::GenericFrameTransformer(inputFrame_fp2,
-                                                                                            outputFrame_fp2);
-    frameTransform_fp2->setTransform(transform_fp2);
-    
-    human::FTForceReader *forceReader2 = new human::FTForceReader(appliedLink_fp2,
-                                                                  inputFrame_fp2,
-                                                                  *secondSensor);
-    forceReader2->setTransformer(frameTransform_fp2);
-    m_readers.push_back(forceReader2);
-    
-    
-    /* ******************* NOTE ON THE ROBOT ***********************************
-     * From the robot we need:
-     * 1 -> the configuration of the robot joints of interest handled by a
-     *      RemoteControlBoardRemapper device (documented in 
-     *      YARP/RemoteControlBoardRemapper);
-     * 2 -> the configuration of the human
-     * *************************************************************************/
-    
-    /*
      * ------Models loading
      */
-    std::string humanModelFilename = rf.find("humanModelFilename").asString();
-    std::string robotModelFilename = rf.find("robotModelFilename").asString();
     
+    // Human model
+    const std::string humanModelFilename = rf.findFile("humanModelFilename");
+    
+    std::vector<std::string> human_jointList;
+    yarp::os::Value jointListValue = rf.find("human_JointList");
+    if (jointListValue.isString()) {
+        std::string configJointFile = rf.findFileByName(jointListValue.asString());
+        yarp::os::Property config;
+        if (config.fromConfigFile(configJointFile, true)) {
+            if (!parseStringListOption(config.find("jointList"), human_jointList)) {
+                yError() << "Error while parsing joints list";
+                return false;
+            }
+        } else {
+            yError() << "Could not parse " << configJointFile;
+            return false;
+        }
+    }
+    else if (jointListValue.isList()) {
+        if (!parseStringListOption(jointListValue, human_jointList)) {
+            yError() << "Error while parsing joints list";
+            return false;
+        }
+    } else {
+        yError() << "\"jointList\" parameter malformed";
+        return false;
+    }
+    
+    yInfo() << "Joints from config file: " << human_jointList.size() << human_jointList;
+        
     iDynTree::ModelLoader modelLoader;
-    if(!modelLoader.loadModelFromFile(humanModelFilename))
+    
+    if(!modelLoader.loadReducedModelFromFile(humanModelFilename, human_jointList))
     {
         yError("Something wrong with the human model loading!");
         return false;
     }
-    iDynTree::Model humanModel = modelLoader.model();
     
-    if(!modelLoader.loadModelFromFile(robotModelFilename))
+    iDynTree::Model humanModel = modelLoader.model();
+
+    //Robot model
+    const std::string robotModelFilename = rf.findFile("robotModelFilename");
+    std::vector<std::string> robot_jointList;
+    
+    if (!parseStringListOption(rf.find("robot_JointList"), robot_jointList))
+    {
+        yError("Error while parsing the robot joint list");
+        return false;
+    }
+    
+    if(!modelLoader.loadReducedModelFromFile(robotModelFilename, robot_jointList))
     {
         yError("Something wrong with the robot model loading!");
         return false;
     }
     iDynTree::Model robotModel = modelLoader.model();
-    
+
+    yarp::os::Value falseValue;
+    falseValue.fromString("false");
+    bool autoconnect = rf.check("autoconnect",
+                                falseValue,
+                                "Checking the autoconnect option").asBool();
+
+    if (rf.check("rosTopic", falseValue, "Checking support for ROS topics").asBool())
+    {
+        m_rosNode = new yarp::os::Node("/" + getName());
+        if (!m_rosNode)
+        {
+            yError("Could not create ROS node %s", ("/" + getName()).c_str());
+            close();
+            return false;
+        }
+
+        m_tfPrefix = rf.check("rosTFPrefix", yarp::os::Value(""), "Checking TF prefix").asString();
+    }
+
     /*
-     *  ------Settings for the transforms
+     * ------Reading the specified sources (in file .ini)
      */
-    iDynTree::Rotation robotLeftSole_R_humanLeftSole;
-    iDynTree::Position robotLeftSole_pos_humanLeftSole;
-    
-    if (!parseRotationMatrix(rf.find("robotLeftSole_R_humanLeftSole"), robotLeftSole_R_humanLeftSole))
+    std::vector<std::string> sources;
+    if (!parseStringListOption(rf.find("sources"), sources))
     {
-        yError("Somenthing wrong in parsing the rotation matrix between robotLeftSole and humanLeftSole!");
-        return false;
+        yWarning("No source specified.  This module will do nothing.");
     }
-    if (!parsePositionVector(rf.find("robotLeftSole_pos_humanLeftSole"), robotLeftSole_pos_humanLeftSole))
-    {
-        yError("Somenthing wrong in parsing the position between robotLeftSole and humanLeftSole!");
-        return false;
-    }
-    iDynTree::Transform robotLeftSole_T_humanLeftSole(robotLeftSole_R_humanLeftSole,
-                                                      robotLeftSole_pos_humanLeftSole);
-    
-    //TODO: check on strings
-    std::string frameRobotSole   = rf.find("frameRobotSole").asString();
-    std::string frameHumanFoot   = rf.find("frameHumanFoot").asString();
-    std::string frameRobotArm_left   = rf.find("frameRobotArm_left").asString();
-    std::string frameRobotArm_right  = rf.find("frameRobotArm_right").asString();
-    std::string frameHumanHand_left  = rf.find("frameHumanHand_left").asString();
-    std::string frameHumanHand_right = rf.find("frameHumanHand_right").asString();
-    
-    /*
-     * ------Robot configuration for the RemoteControlBoardRemapper
-     */
-    yarp::os::Property options_robot;
-    options_robot.put("device", "remotecontrolboardremapper");
-    yarp::os::Bottle axesNames;
-    yarp::os::Bottle &axesList = axesNames.addList();
-    yarp::os::Bottle *axesNameList = rf.find("axesNames").asList();
-    
-    if (!axesNameList)
-    {
-        //TODO: check on the order of joints == same as the one in the iCub urdf!!
-    }
-    
-    axesList = *axesNameList;
-    axesList.addString("torso_pitch");
-    axesList.addString("torso_roll");
-    axesList.addString("torso_yaw");
-    axesList.addString("l_shoulder_pitch");
-    axesList.addString("l_shoulder_roll");
-    axesList.addString("l_shoulder_yaw");
-    axesList.addString("l_elbow");
-    axesList.addString("r_shoulder_pitch");
-    axesList.addString("r_shoulder_roll");
-    axesList.addString("r_shoulder_yaw");
-    axesList.addString("r_elbow");
-    axesList.addString("l_hip_picth");
-    axesList.addString("l_hip_roll");
-    axesList.addString("l_hip_yaw");
-    axesList.addString("l_knee");
-    axesList.addString("l_ankle_pitch");
-    axesList.addString("l_ankle_roll");
-    axesList.addString("r_hip_picth");
-    axesList.addString("r_hip_roll");
-    axesList.addString("r_hip_yaw");
-    axesList.addString("r_knee");
-    axesList.addString("r_ankle_pitch");
-    axesList.addString("r_ankle_roll");
-    options_robot.put("axesNames", axesNames.get(0));
-    
-    yarp::os::Bottle remoteControlBoards;
-    yarp::os::Bottle & remoteControlBoardsList = remoteControlBoards.addList();
-    remoteControlBoardsList.addString("/icub/torso");
-    remoteControlBoardsList.addString("/icub/left_leg");
-    remoteControlBoardsList.addString("/icub/right_leg");
-    remoteControlBoardsList.addString("/icub/left_arm");
-    remoteControlBoardsList.addString("/icub/right_arm");
-    options_robot.put("remoteControlBoards", remoteControlBoards.get(0));
-    options_robot.put("localPortPrefix", "/" + getName() + "/robot");
-    
-    
-    // Open the polydriver for the joints configuration
-    ok = m_PolyRobot.open(options_robot);
-    if (!ok)
-    {
-        yError("Error in opening the device for the robot!");
-        close();
-        return false;
-    }
-    
-    yarp::dev::IEncoders *robotEncoder = 0;
-    if (!m_PolyRobot.view(robotEncoder) || !robotEncoder)
-    {
-        yError("Error in viewing robot sensors!");
-        close();
-        return false;
-    }
-    
-    /*
-     * ------Open ports for robot forces
-     */
-    if (!m_robotLeftArmForce_port.open("/robotLeftForces:i"))
-    {
-        yError() << "Unable to open port /robotLeftForces:i";
-        return false;
-    }
-    
-    if (!m_robotRightArmForce_port.open("/robotRightForces:i"))
-    {
-        yError() << "Unable to open port /robotRightForces:i";
-        return false;
-    }
-    
-    //-----------------------FTS SENSOR ON ROBOT RIGHT ARM -----------------------//
 
-    std::string humanContactLinkWithRobotRightArm = rf.find("humanContactLinkWithRobotRightArm").asString();
+    if (m_rosNode)
+    {
+        m_topics.resize(sources.size());
+        m_rosSequence = 1;
+    }
 
-    human::RobotFrameTransformer *frameTransform_robotRightArm = new human::RobotFrameTransformer(robotLeftSole_T_humanLeftSole,
-                                                                                                 frameRobotArm_right,
-                                                                                                 frameRobotSole,
-                                                                                                 frameHumanFoot,
-                                                                                                 frameHumanHand_left,
-                                                                                                 *robotEncoder,
-                                                                                                 m_humanJointConfiguration_port);
-    frameTransform_robotRightArm->init(humanModel, robotModel);
-    
-    human::PortForceReader *forceReader3 = new human::PortForceReader(humanContactLinkWithRobotRightArm,
-                                                                      frameRobotArm_right,
-                                                                      m_robotRightArmForce_port);
-    forceReader3->setTransformer(frameTransform_robotRightArm);
-    m_readers.push_back(forceReader3);
-    
-    //-----------------------FTS SENSOR ON ROBOT LEFT ARM -----------------------//
-    
-    std::string humanContactLinkWithRobotLeftArm = rf.find("humanContactLinkWithRobotLeftArm").asString();
-    
-    human::RobotFrameTransformer *frameTransform_robotLeftArm = new human::RobotFrameTransformer(robotLeftSole_T_humanLeftSole,
-                                                                                                 frameRobotArm_left,
-                                                                                                 frameRobotSole,
-                                                                                                 frameHumanFoot,
-                                                                                                 frameHumanHand_right,
-                                                                                                 *robotEncoder,
-                                                                                                 m_humanJointConfiguration_port);
-    frameTransform_robotLeftArm->init(humanModel, robotModel);
-    
-    human::PortForceReader *forceReader4 = new human::PortForceReader(humanContactLinkWithRobotLeftArm,
-                                                                      frameRobotArm_left,
-                                                                      m_robotRightArmForce_port);
-    forceReader4->setTransformer(frameTransform_robotLeftArm);
-    m_readers.push_back(forceReader4);
+    for(std::vector<std::string>::const_iterator it = sources.begin(); it != sources.end(); ++it)
+    {
+        yarp::os::Bottle sourceGroup = rf.findGroup("FORCE_SOURCE_" + *it);
+        if (sourceGroup.isNull())
+        {
+            yWarning("Could not find group %s",("FORCE_SOURCE_" + *it).c_str());
+            continue;
+        }
+        std::string type = sourceGroup.find("type").asString();
+        if (type.empty())
+        {
+            yWarning("Could not find \"type\" parameter for group %s",("FORCE_SOURCE_" + *it).c_str());
+            continue;
+        }
+        std::string remote = sourceGroup.find("remote").asString();
+        if (remote.empty())
+        {
+            yWarning("Could not find \"remote\" parameter for group %s",("FORCE_SOURCE_" + *it).c_str());
+            continue;
+        }
+        std::string appliedLink = sourceGroup.find("appliedLink").asString();
+        if (appliedLink.empty())
+        {
+            yWarning("Could not find \"appliedLink\" parameter for group %s",("FORCE_SOURCE_" + *it).c_str());
+            continue;
+        }
+        std::string inputFrame = sourceGroup.find("inputFrame").asString();
+        if (inputFrame.empty())
+        {
+            yWarning("Could not find \"inputFrame\" parameter for group %s",("FORCE_SOURCE_" + *it).c_str());
+            continue;
+        }
+        
+        human::AbstractForceReader *forceReader = 0;
+        
+        if (type == "analogsensor")
+        {
+            yarp::os::Property options;
+            options.put("device", "analogsensorclient");
+            options.put("local", "/" + getName() + "/source_" + *it );  //local port name
+            options.put("remote", remote);                              //device port name where we connect to
+            
+            yarp::dev::PolyDriver *driver = new yarp::dev::PolyDriver();
+            if (!driver)
+            {
+                yError("Error in creating analogserver device [%s]", remote.c_str());
+                close();
+                return false;
+            }
+            m_drivers.push_back(driver);
+            
+            if (!driver->open(options))
+            {
+                yError("Error in opening analogserver device [%s]", remote.c_str());
+                close();
+                return false;
+            }
+            
+            yarp::dev::IAnalogSensor *analogSensor = 0;
+            if (!driver->view(analogSensor) || !analogSensor)
+            {
+                yError("Device [%s] does not support IAnalogSensor interface", remote.c_str());
+                close();
+                return false;
+            }
+            
+            forceReader = new human::FTForceReader(appliedLink,
+                                                   inputFrame,
+                                                   *analogSensor);
+        }
+        else if (type == "port")
+        {
+            yarp::os::BufferedPort<yarp::sig::Vector> *port = new yarp::os::BufferedPort<yarp::sig::Vector>;
+            if(!port)
+            {
+                yError("Unable to create input port [%s]", ("/" + getName() + "/source_" + *it + "/force:i").c_str());
+                close();
+                return false;
+            }
+            m_ports.push_back(port);
+            
+            if (!port->open("/" + getName() + "/source_" + *it + "/force:i"))
+            {
+                yError("Unable to open input port [%s]", ("/" + getName() + "/source_" + *it + "/force:i").c_str());
+                close();
+                return false;
+            }
+            if (autoconnect)
+            {
+                if (!yarp::os::Network::connect(remote, port->getName()))  //to connect remote and local port
+                {
+                    yError("Unable to connect port [%s] to [%s]", remote.c_str(), port->getName().c_str());
+                    close();
+                    return false;
+                }
+            }
+            
+            forceReader = new human::PortForceReader(appliedLink,
+                                                     inputFrame,
+                                                     *port);
 
+        }
 
-    /* *****************************************************************************/
+        if (!forceReader)
+        {
+            yError("Cannot create source of type [%s]", type.c_str());
+            close();
+            return false;
+        }
+        m_readers.push_back(forceReader);
+
+        if (m_rosNode)
+        {
+            //create also topic
+            std::vector<std::string>::difference_type index = std::distance<std::vector<std::string>::const_iterator>(sources.begin(), it);
+            if (index >= 0) {
+                m_topics[static_cast<size_t>(index)] = new yarp::os::Publisher<geometry_msgs::WrenchStamped>();
+                if (m_topics[static_cast<size_t>(index)]) {
+                    std::string ROSname = getName();
+                    while(ROSname.find("-")!=std::string::npos) {
+                        ROSname.replace(ROSname.find("-"),1,"_");
+                    }
+                    m_topics[static_cast<size_t>(index)]->topic("/" + ROSname + "/" + appliedLink);
+                }
+            }
+
+        }
+        
+        yarp::os::Bottle transformationGroup = rf.findGroup("TRANSFORMATION_" + *it);
+        if (transformationGroup.isNull())
+        {
+            yWarning("Could not find group %s",("TRANSFORMATION_" + *it).c_str());
+            continue;
+        }
+        std::string transformType = transformationGroup.find("type").asString();
+        if (transformType.empty())
+        {
+            yWarning("Could not find \"type\" parameter for group %s",("TRANSFORMATION_" + *it).c_str());
+            continue;
+        }
+        std::string outputFrame = transformationGroup.find("outputFrame").asString();
+        if (outputFrame.empty())
+        {
+            yWarning("Could not find \"outputFrame\" parameter for group %s",("TRANSFORMATION_" + *it).c_str());
+            continue;
+        }
+        iDynTree::Rotation rotationMatrix;
+        if (!parseRotationMatrix(transformationGroup.find("rotationMatrix"), rotationMatrix))
+        {
+            yError("Error parsing the rotation matrix in group %s", ("TRANSFORMATION_" + *it).c_str());
+            continue;
+        }
+        iDynTree::Position originPosition;
+        if (!parsePositionVector(transformationGroup.find("originPosition"), originPosition))
+        {
+            yError("Error parsing the origin position in group %s", ("TRANSFORMATION_" + *it).c_str());
+            continue;
+        }
+        iDynTree::Position humanFootPosition;
+        humanFootPosition.zero();
+        if (transformationGroup.check("humanFootPosition", "Checking optional parameter humanFootPosition")) {
+            if (!parsePositionVector(transformationGroup.find("humanFootPosition"), humanFootPosition))
+            {
+                yError("Error parsing the  human foot position in group %s", ("TRANSFORMATION_" + *it).c_str());
+                continue;
+            }
+        }
+        
+        human::FrameTransformer *frameTransform = 0;
+        
+        if (transformType == "constant")
+        {
+            human::GenericFrameTransformer *genericFrameTransform = new human::GenericFrameTransformer(inputFrame,
+                                                                                                       outputFrame);
+            if (!genericFrameTransform)
+            {
+                close();
+                return false;
+            }
+            genericFrameTransform->setTransform(iDynTree::Transform(rotationMatrix, originPosition));
+            frameTransform = genericFrameTransform;
+        }
+        else if (transformType == "robot")
+        {
+            std::string humanLinkingFrame = transformationGroup.find("humanLinkingFrame").asString();
+            if (humanLinkingFrame.empty())
+            {
+                yWarning("Could not find \"humanLinkingFrame\" parameter for group %s",("TRANSFORMATION_" + *it).c_str());
+                continue;
+            }
+            std::string robotLinkingFrame = transformationGroup.find("robotLinkingFrame").asString();
+            if (robotLinkingFrame.empty())
+            {
+                yWarning("Could not find \"robotLinkingFrame\" parameter for group %s",("TRANSFORMATION_" + *it).c_str());
+                continue;
+            }
+            
+            iDynTree::Transform l_sole_H_LeftSole = iDynTree::Transform(rotationMatrix, originPosition);
+            iDynTree::Transform LeftSole_H_LeftFoot = iDynTree::Transform(iDynTree::Rotation::Identity(), humanFootPosition);
+            iDynTree::Transform fixtureTransform = l_sole_H_LeftSole * LeftSole_H_LeftFoot;
+
+            yarp::os::BufferedPort<human::HumanState>* humanPort = getHumanStatePort(rf);
+            if (!humanPort)
+            {
+                yError("Failed to obtain connection to human state port");
+                return false;
+            }
+
+            yarp::dev::IEncoders *robotEncoders = 0;
+
+            if (!getRobotEncodersInterface(rf, robot_jointList, robotEncoders) || !robotEncoders)
+            {
+                yError("Failed to open robot IEncoders interface");
+                return false;
+            }
+
+            human::RobotFrameTransformer *robotFrameTransform = new human::RobotFrameTransformer(fixtureTransform,
+                                                                                                 inputFrame,
+                                                                                                 robotLinkingFrame,
+                                                                                                 humanLinkingFrame,
+                                                                                                 outputFrame,
+                                                                                                 *robotEncoders,
+                                                                                                 *humanPort);
+            if (!robotFrameTransform)
+            {
+                close();
+                return false;
+            }
+            
+            robotFrameTransform->init(humanModel, robotModel);
+            frameTransform = robotFrameTransform;
+        }
+    
+        forceReader->setTransformer(frameTransform);
+    }
     
     /*
      * ------Open port:o for the module output (to the next module human-dynamics-estimation)
      */
-    if (!m_output_port.open("/"+ getName() + "/forces:o"))
+    if (!m_outputPort.open("/" + getName() + "/forces:o"))
     {
-        yError() << "Unable to open port " << (getName() + "/forces:o");
+        yError("Unable to open port %s", ("/" + getName() + "/forces:o").c_str());
         return false;
     }
     
-    human::HumanForces &allForces = m_output_port.prepare();
-    allForces.forces.reserve(2);
-    m_output_port.unprepare();
+    human::HumanForces &allForces = m_outputPort.prepare();
+    allForces.forces.reserve(m_readers.size());
+    m_outputPort.unprepare();
+    yInfo("%s properly configured", getName().c_str());
     return true;
 }
 
 //---------------------------------------------------------------------
 bool HumanForcesProvider::updateModule()
 {
-    human::HumanForces &allForces = m_output_port.prepare();
+    human::HumanForces &allForces = m_outputPort.prepare();
     std::vector<human::Force6D> &forcesVector = allForces.forces;
     
     forcesVector.resize(m_readers.size());
-    for (std::vector<human::ForceReader*>::iterator it(m_readers.begin());
-         it != m_readers.end(); ++it) {
-        std::vector<human::ForceReader*>::difference_type index = std::distance(m_readers.begin(), it);
-        assert(index >= 0);
-        (*it)->readForce(forcesVector[static_cast<size_t>(index)]);
-    }
-    
+    for (size_t index = 0; index < m_readers.size(); ++index) {
+        human::Force6D &currentForce = forcesVector[index];
+        m_readers[index]->readForce(currentForce);
 
+        if (m_rosNode && m_topics[index])
+        {
+            geometry_msgs::WrenchStamped &wrench = m_topics[index]->prepare();
+
+            wrench.header.seq = m_rosSequence;
+            wrench.header.stamp = normalizeSecNSec(yarp::os::Time::now());
+            wrench.header.frame_id = m_tfPrefix + currentForce.appliedLink;
+
+            wrench.wrench.force.x = currentForce.fx;
+            wrench.wrench.force.y = currentForce.fy;
+            wrench.wrench.force.z = currentForce.fz;
+            wrench.wrench.torque.x = currentForce.ux;
+            wrench.wrench.torque.y = currentForce.uy;
+            wrench.wrench.torque.z = currentForce.uz;
+
+            m_topics[index]->write();
+        }
+    }
+
+    m_rosSequence++;
     /*
      * ------Write data on port:o
      */
-    m_output_port.write();
+    m_outputPort.write();
     return true;
 }
 
 //---------------------------------------------------------------------
 bool HumanForcesProvider::close()
 {
-    //releasing allocated memory
-    for (std::vector<human::ForceReader*>::iterator it(m_readers.begin());
+    /*
+     * ------Releasing allocated memory for m_readers
+     */
+    for (std::vector<human::ForceReader*>::iterator it = m_readers.begin();
     it != m_readers.end(); ++it)
     {
         human::AbstractForceReader *AbstractForceReader = dynamic_cast<human::AbstractForceReader*>(*it);
@@ -483,20 +596,65 @@ bool HumanForcesProvider::close()
     }
     m_readers.clear();
     
-    m_output_port.close();
-    m_robotRightArmForce_port.close();
-    m_robotLeftArmForce_port.close();
-    m_humanJointConfiguration_port.close();
+    /*
+     * ------Close the m_outputPort
+     */
+    m_outputPort.close();
     
+    /*
+     * ------Releasing allocated memory for m_ports
+     */
+    for(std::vector<yarp::os::BufferedPort<yarp::sig::Vector>*>::const_iterator it = m_ports.begin();
+        it != m_ports.end(); ++it)
+    {
+        if (!(*it)) {
+            continue;
+        }
+        (*it)->close();
+        delete *it;
+    }
+    m_ports.clear();
+
+    /*
+     * ------Releasing allocated memory for m_topics
+     */
+    for (std::vector<yarp::os::Publisher<geometry_msgs::WrenchStamped>*>::iterator it(m_topics.begin());
+         it != m_topics.end(); ++it)
+    {
+        if (!(*it)) {
+            continue;
+        }
+        (*it)->close();
+        delete *it;
+    }
+    m_topics.clear();
     
-    m_PolyRobot.close();
-    m_forcePoly2.close();
-    m_forcePoly1.close();
+    /*
+     * ------Close the m_humanJointConfigurationPort
+     */
+    m_humanJointConfigurationPort.close();
     
+    /*
+     * ------Close the m_robot port
+     */
+    m_robot.close();
+    
+    /*
+     * ------Releasing allocated memory for m_drivers
+     */
+    for(std::vector<yarp::dev::PolyDriver*>::const_iterator it = m_drivers.begin();
+        it != m_drivers.end(); ++it)
+    {
+        (*it)->close();
+        delete *it;
+    }
+    m_drivers.clear();
+
+    delete m_rosNode;
+    m_rosNode = 0;
+
     return true;
 }
-
-
 
 //---------------------------------------------------------------------------
 /*
@@ -548,6 +706,23 @@ static bool parsePositionVector(const yarp::os::Value& ini, iDynTree::Position& 
     for (int i = 0; i < list->size(); ++i)
     {
         position.setVal(i, list->get(i).asDouble());
+    }
+    return true;
+}
+
+
+static bool parseStringListOption(const yarp::os::Value &option, std::vector<std::string> &parsedList)
+{
+    if (option.isNull() || !option.isList() || !option.asList()) return false;
+    yarp::os::Bottle *frames = option.asList();
+    parsedList.reserve(static_cast<size_t>(frames->size()));
+    
+    for (int i = 0; i < frames->size(); ++i)
+    {
+        if (frames->get(i).isString())
+        {
+            parsedList.push_back(frames->get(i).asString());
+        }
     }
     return true;
 }

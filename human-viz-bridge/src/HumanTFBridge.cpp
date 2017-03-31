@@ -1,15 +1,16 @@
-#include "geometry_msgs_Quaternion.h"
-#include "geometry_msgs_TransformStamped.h"
-#include "geometry_msgs_Vector3.h"
-#include "msgs/String.h"
-#include "std_msgs_Header.h"
-#include "tf2_msgs_TFMessage.h"
+#include <geometry_msgs_Quaternion.h>
+#include <geometry_msgs_TransformStamped.h>
+#include <geometry_msgs_Vector3.h>
+#include <msgs/String.h>
+#include <std_msgs_Header.h>
+#include <tf2_msgs_TFMessage.h>
+#include <TickTime.h>
 #include "thrift/XsensDriverService.h"
 #include "thrift/XsensSegmentsFrame.h"
 
 #include <iDynTree/Model/Indeces.h>
 #include <iDynTree/ModelIO/ModelLoader.h>
-#include <TickTime.h>
+
 #include <yarp/os/BufferedPort.h>
 #include <yarp/os/LogStream.h>
 #include <yarp/os/Network.h>
@@ -21,7 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
-#include <limits.h>
+#include <climits>
 #include <string>
 #include <vector>
 
@@ -68,8 +69,6 @@ class HumanTFBridge : public RFModule, public TypedReaderCallback<XsensSegmentsF
     XsensDriverService xsensDriver;
     
     Publisher<tf2_msgs_TFMessage> publisher_tf;
-    
-    //variables declaration
     tf2_msgs_TFMessage tf;
     vector<string> segments;
     vector<string> fakeSegments;
@@ -145,7 +144,6 @@ public:
             }
         }   
         
-        vector<string> fakeSegments;
         fakeSegments.reserve(model.getNrOfLinks() - segments.size());
         for (iDynTree::LinkIndex linkIndex = 0; linkIndex < model.getNrOfLinks(); ++linkIndex) {
             string linkName = model.getLinkName(linkIndex);
@@ -158,7 +156,7 @@ public:
         yInfo() << "Fake Segments: " << fakeSegments;
         
         string worldRFName = rf.find("worldRFName").asString();
-	string tfPrefix = rf.find("tfPrefix").asString();
+        string tfPrefix = rf.find("tfPrefix").asString();
         for (size_t index = 0; index < segments.size(); ++index) {
             tf.transforms[index].child_frame_id = tfPrefix + "/" + segments[index];
             tf.transforms[index].header.frame_id = worldRFName;
@@ -204,8 +202,11 @@ public:
     }
     
     virtual void onRead(XsensSegmentsFrame& xsensData) {
+
+        if (xsensData.status != xsens::OK) return;
     
         TickTime currentTime = normalizeSecNSec(yarp::os::Time::now());
+        tf2_msgs_TFMessage &tfMsg = publisher_tf.prepare();
         // Send the transforms
         for (size_t index = 0; index < segments.size(); ++index){
             tf.transforms[index].header.seq   = index;
@@ -219,10 +220,11 @@ public:
             tf.transforms[index].transform.rotation.w = xsensData.segmentsData[index].orientation.w;
         }
           
-         for (size_t index = 0; index < fakeSegments.size(); ++index) {
+        for (size_t index = 0; index < fakeSegments.size(); ++index) {
             tf.transforms[segments.size() + index].header.stamp = currentTime;
         }
-        publisher_tf.write(tf); 
+        tfMsg = tf;
+        publisher_tf.write(); 
     }
 };
 

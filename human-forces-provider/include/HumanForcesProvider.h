@@ -17,6 +17,8 @@
 #include <thrifts/HumanForces.h>
 #include <thrifts/HumanState.h>
 
+#include <geometry_msgs/WrenchStamped.h>
+
 
 namespace human
 {
@@ -26,9 +28,17 @@ namespace human
 
 namespace yarp
 {
+    namespace os
+    {
+        class Node;
+
+        template<typename T>
+        class Publisher;
+    }
     namespace dev
     {
         class IAnalogSensor;
+        class IEncoders;
     }
 }
 
@@ -41,23 +51,30 @@ private:
     //buffered port:i from the <human-state-provider> module
     //for the human configuration (together with the robot joint configuration
     //it will be useful for converting the forces from the robot to the human frames.)
-    yarp::os::BufferedPort<human::HumanState> m_humanJointConfiguration_port;
-    
-    //polydriver for forceplates handling
-    yarp::dev::PolyDriver m_forcePoly1;
-    yarp::dev::PolyDriver m_forcePoly2;
+    bool m_humanConfigured;
+    yarp::os::BufferedPort<human::HumanState> m_humanJointConfigurationPort;
     
     //polidriver for robot configuration handling
-    yarp::dev::PolyDriver m_PolyRobot;
-    
-    //buffered port:i from the robot forces estimated in the two arms
-    yarp::os::BufferedPort<yarp::sig::Vector> m_robotLeftArmForce_port;
-    yarp::os::BufferedPort<yarp::sig::Vector> m_robotRightArmForce_port;
+    bool m_robotConfigured;
+    yarp::dev::PolyDriver m_robot;
     
     //buffered port:o from <human-forces-provider> module
-    yarp::os::BufferedPort<human::HumanForces> m_output_port;
+    yarp::os::BufferedPort<human::HumanForces> m_outputPort;
+    
 
     std::vector<human::ForceReader*> m_readers;
+    std::vector<yarp::dev::PolyDriver*> m_drivers;
+    std::vector<yarp::os::BufferedPort<yarp::sig::Vector>*> m_ports;
+
+    yarp::os::Node *m_rosNode;
+    std::string m_tfPrefix;
+    std::vector<yarp::os::Publisher<geometry_msgs::WrenchStamped>*> m_topics;
+    unsigned m_rosSequence;
+
+    yarp::os::BufferedPort<human::HumanState>* getHumanStatePort(const yarp::os::Searchable& config);
+    bool getRobotEncodersInterface(const yarp::os::Searchable& config,
+                                   const std::vector<std::string>& robot_jointList,
+                                   yarp::dev::IEncoders *& encoders);
     
 public:
     /*!

@@ -43,6 +43,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/i
 ## Specify targets for the linkage
 target_link_libraries(${PROJECT_NAME} human-forces-provider-data 
                                       human-state-provider-data
+                                      human-rosmsgs
                                       YARP::YARP_OS
                                       YARP::YARP_init
                                       YARP::YARP_sig
@@ -54,4 +55,6 @@ target_link_libraries(${PROJECT_NAME} human-forces-provider-data
 add_warnings_configuration_to_target(TARGETS ${PROJECT_NAME} PRIVATE)
 
 target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE ${EIGEN3_INCLUDE_DIR})
+
+yarp_install(FILES app/conf/human-forces-provider.ini DESTINATION ${YARP_CONTEXTS_INSTALL_DIR}/human-dynamic-estimation)
 
